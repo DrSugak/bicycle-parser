@@ -8,6 +8,20 @@ from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 
 
+class Request:
+    @staticmethod
+    def request(links: list, user_agent: dict) -> list:
+        responses = []
+        with requests.Session() as session:
+            for link in links:
+                try:
+                    response = session.get(link, headers=user_agent, timeout=10)
+                    responses.append(response)
+                except requests.exceptions.RequestException:
+                    continue
+        return responses
+
+
 class Olx:
     def __init__(self, db_size: int, html_parser: str, user_agent: str) -> None:
         self.base_url = "https://www.olx.ua"
