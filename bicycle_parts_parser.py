@@ -1,4 +1,3 @@
-from datetime import datetime
 from threading import Thread
 
 import lxml
@@ -24,75 +23,78 @@ class Request:
 
 class Olx:
     def __init__(self, db_size: int, html_parser: str, user_agent: str) -> None:
-        self.base_url = "https://www.olx.ua"
-        self.category_url = [
-            "/hobbi-otdyh-i-sport/velo/velozapchasti/",
-            "/hobbi-otdyh-i-sport/velo/veloaksessuary/",
-        ]
-        self.last_part_url = "?currency=UAH&search[order]=created_at:desc&view=list"
+        self.send_notice = db_size > 0
         self.html_parser = html_parser
         self.user_agent = {"User-Agent": user_agent}
-        self.send_notice = db_size > 0
+        self.base_url = "https://www.olx.ua"
+        self.category = "/hobbi-otdyh-i-sport/velo"
+        self.subcategories = []
+        self.last_part_url = "?currency=UAH&search[order]=created_at:desc&view=list"
+        self.responses = []
 
     def main(self) -> None:
-        self.parse_all_pages()
+        self.subcategories = self.find_subcategories()
+        for subcategory in self.subcategories:
+            link = f"{self.base_url}{self.category}{subcategory}{self.last_part_url}"
+            response = Request.request([link], self.user_agent)
+            self.responses += response
+            if response:
+                links = self.find_pagination(response[0], subcategory)
+                responses = Request.request(links, self.user_agent)
+                self.responses += responses
+        if self.responses:
+            self.parse_all_pages()
+
+    def find_subcategories(self) -> list:
+        subcategories = []
+        link = f"{self.base_url}{self.category}"
+        response = Request.request([link], self.user_agent)
+        if response:
+            soup = BeautifulSoup(response[0].content, self.html_parser)
+            try:
+                tags = soup.find("ul", {"data-testid": "category-count-links"}).find_all("li")
+                for tag in tags:
+                    subcategories.append(f"/{tag.find("a").get("href").split("/velo/")[-1]}")
+            except AttributeError:
+                pass
+        return subcategories
+
+    def find_pagination(self, response, subcategory: str) -> list:
+        links = []
+        soup = BeautifulSoup(response.content, self.html_parser)
+        tags = soup.find_all("li", {"data-testid": "pagination-list-item"})
+        if tags:
+            last_page = int(tags[-1].get_text())
+            for number in range(2, last_page + 1):
+                link = f"{self.base_url}{self.category}{subcategory}{self.last_part_url}&page={number}"
+                links.append(link)
+        return links
 
     def parse_all_pages(self) -> None:
-        for category in self.category_url:
-            link = self.base_url + category + self.last_part_url
-            try:
-                page = requests.get(link, headers=self.user_agent, timeout=10)
-            except requests.exceptions.RequestException:
-                return
-            soup = BeautifulSoup(page.content, self.html_parser)
+        for response in self.responses:
+            soup = BeautifulSoup(response.content, self.html_parser)
             self.find_all_ads_on_page(soup)
-            pagination = soup.find_all("li", {"data-testid": "pagination-list-item"})
-            last_page = int(pagination[-1].get_text())
-            for number in range(2, last_page + 1):
-                next_page_url = f"?currency=UAH&page={number}&search[order]=created_at:desc&view=list"
-                link = self.base_url + category + next_page_url
-                try:
-                    page = requests.get(link, headers=self.user_agent, timeout=10)
-                except requests.exceptions.RequestException:
-                    return
-                soup = BeautifulSoup(page.content, self.html_parser)
-                self.find_all_ads_on_page(soup)
 
     def find_all_ads_on_page(self, soup: BeautifulSoup) -> None:
         ads = soup.find_all("div", {"data-cy": "l-card", "data-testid": "l-card"})
         for ad in ads:
             try:
                 advert = {}
-                advert["title"] = ad.find("h6").get_text().lower()
+                advert["title"] = ad.find("h4").get_text().lower()
                 advert["price"] = ad.find("p", {"data-testid": "ad-price"}).get_text().split("грн")[0].strip()
-                advert["link"] = self.base_url + ad.find("a").get("href")
-                date = ad.find("p", {"data-testid": "location-date"}).get_text().split("-")[-1].strip()
+                advert["link"] = f"{self.base_url}{ad.find("a").get("href")}"
             except AttributeError:
                 continue
-            if "/uk/" in advert["link"]:
-                href = advert["link"].split("/uk/")
-                advert["link"] = href[0] + "/" + href[1]
-            if "/obyavlenie/" in advert["link"]:
-                if len(date.split()[0]) != 2:
-                    self.check_ad(ad["id"], advert)
+            if self.send_notice:
+                self.send_advert(ad["id"], advert)
 
-    def check_ad(self, _id: str, advert: dict) -> None:
-        try:
-            page = requests.get(advert["link"], headers=self.user_agent, timeout=10)
-        except requests.exceptions.RequestException:
-            return
-        soup = BeautifulSoup(page.content, self.html_parser)
-        try:
-            category = soup.find("ol", {"data-cy": "categories-breadcrumbs"}).find_all("li")[3].find("a").get("href")
-        except AttributeError:
-            return
-        if (self.category_url[0] or self.category_url[1]) in category:
-            with redis.Redis(decode_responses=True) as redis_client:
-                exists = redis_client.exists(_id)
-                if not exists:
-                    redis_client.hset(_id, mapping=advert)
-                    if self.send_notice:
-                        redis_client.publish("bicycle", _id)
+    def send_advert(self, _id: str, advert: dict) -> None:
+        _id = f"olx:{_id}"
+        with redis.Redis(decode_responses=True) as redis_client:
+            exists = redis_client.exists(_id)
+            if not exists:
+                redis_client.hset(_id, mapping=advert)
+                redis_client.publish("bicycle", _id)
 
 
 class XT:
@@ -199,22 +201,19 @@ def main() -> None:
     except redis.exceptions.ConnectionError:
         return
     html_parser = lxml.__name__
-    while True:
-        user_agent = UserAgent(platforms="pc").random
-        print("Start", datetime.now())
-        olx = Olx(db_size, html_parser, user_agent)
-        xt = XT(db_size, html_parser, user_agent)
-        x_bikers = XBikers(db_size, html_parser, user_agent)
-        thread_olx = Thread(target=olx.main)
-        thread_xt = Thread(target=xt.main)
-        thread_x_bikers = Thread(target=x_bikers.main)
-        thread_olx.start()
-        thread_xt.start()
-        thread_x_bikers.start()
-        thread_olx.join()
-        thread_xt.join()
-        thread_x_bikers.join()
-        print("Finish", datetime.now())
+    user_agent = UserAgent(platforms="pc").random
+    olx = Olx(db_size, html_parser, user_agent)
+    xt = XT(db_size, html_parser, user_agent)
+    x_bikers = XBikers(db_size, html_parser, user_agent)
+    thread_olx = Thread(target=olx.main)
+    thread_xt = Thread(target=xt.main)
+    thread_x_bikers = Thread(target=x_bikers.main)
+    thread_olx.start()
+    thread_xt.start()
+    thread_x_bikers.start()
+    thread_olx.join()
+    thread_xt.join()
+    thread_x_bikers.join()
 
 
 if __name__ == "__main__":
