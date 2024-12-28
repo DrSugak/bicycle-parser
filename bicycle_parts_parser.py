@@ -99,48 +99,49 @@ class Olx:
 
 class XT:
     def __init__(self, db_size: int, html_parser: str, user_agent: str) -> None:
-        self.base_url = "http://xt.ht/phpbb"
-        self.category_url = [
-            "http://xt.ht/phpbb/viewforum.php?f=44&price_type_sel=0&sk=t&sd=d&page=all",
-            "http://xt.ht/phpbb/viewforum.php?f=83&price_type_sel=0&sk=m&sd=d&page=all",
-        ]
+        self.send_notice = db_size > 0
         self.html_parser = html_parser
         self.user_agent = {"User-Agent": user_agent}
-        self.send_notice = db_size > 0
+        self.base_url = "http://xt.ht/phpbb"
+        self.categories = [
+            "/viewforum.php?f=44&price_type_sel=0&sk=t&sd=d&page=all",
+            "/viewforum.php?f=83&price_type_sel=0&sk=m&sd=d&page=all",
+        ]
+        self.responses = []
 
     def main(self) -> None:
-        self.parse_all_pages()
+        for category in self.categories:
+            link = f"{self.base_url}{category}"
+            self.responses += Request.request([link], self.user_agent)
+        if self.responses:
+            self.parse_all_pages()
 
     def parse_all_pages(self) -> None:
-        for category in self.category_url:
-            try:
-                page = requests.get(category, headers=self.user_agent, timeout=10)
-            except requests.exceptions.RequestException:
-                continue
-            soup = BeautifulSoup(page.text, self.html_parser)
+        for response in self.responses:
+            soup = BeautifulSoup(response.content, self.html_parser)
             self.find_all_ads_on_page(soup)
 
     def find_all_ads_on_page(self, soup: BeautifulSoup) -> None:
-        ads = soup.find("div", {"id": "pagecontent"}).find_all("tr")
+        ads = soup.find_all("tr")
         for ad in ads:
             try:
                 advert = {}
                 advert["title"] = ad.find("a", {"class": "topictitle"}).get_text().lower()
                 advert["price"] = ad.find("span", {"name": "uah_cur"}).get_text().split("грн")[0].strip()
-                advert["link"] = self.base_url + ad.find("a", {"class": "topictitle"}).get("href").split("&sid=")[0][1:]
+                advert["link"] = f"{self.base_url}{ad.find("a", {"class": "topictitle"}).get("href").split("&sid=")[0][1:]}"
             except AttributeError:
                 continue
             _id = advert["link"].split(".php?")[1]
-            self.check_ad(_id, advert)
+            if self.send_notice:
+                self.send_advert(_id, advert)
 
-    def check_ad(self, _id: str, advert: dict) -> None:
+    def send_advert(self, _id: str, advert: dict) -> None:
         _id = f"xt:{_id}"
         with redis.Redis(decode_responses=True) as redis_client:
             exists = redis_client.exists(_id)
             if not exists:
                 redis_client.hset(_id, mapping=advert)
-                if self.send_notice:
-                    redis_client.publish("bicycle", _id)
+                redis_client.publish("bicycle", _id)
 
 
 class XBikers:
