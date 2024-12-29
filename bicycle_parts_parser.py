@@ -146,30 +146,35 @@ class XT:
 
 class XBikers:
     def __init__(self, db_size: int, html_parser: str, user_agent: str) -> None:
-        self.base_url = "https://x-bikers.com/board/"
+        self.send_notice = db_size > 0
         self.html_parser = html_parser
         self.user_agent = {"User-Agent": user_agent}
-        self.send_notice = db_size > 0
+        self.base_url = "https://x-bikers.com/board/"
+        self.responses = []
 
     def main(self) -> None:
-        self.parse_all_pages()
+        self.responses += Request.request([self.base_url], self.user_agent)
+        if self.responses:
+            links = self.find_pagination(self.responses[0])
+            self.responses += Request.request(links, self.user_agent)
+            self.parse_all_pages()
+
+    def find_pagination(self, response) -> list:
+        links = []
+        soup = BeautifulSoup(response.content, self.html_parser)
+        try:
+            pagination = soup.find("li", {"class": "last"}).find("a").get("href")
+            last_page = int(pagination.split("page=")[1])
+            for number in range(1, last_page + 1):
+                link = f"{self.base_url}index.php?&page={number}"
+                links.append(link)
+        except AttributeError:
+            pass
+        return links
 
     def parse_all_pages(self) -> None:
-        try:
-            page = requests.get(self.base_url, headers=self.user_agent, timeout=10)
-        except requests.exceptions.RequestException:
-            return
-        soup = BeautifulSoup(page.content, self.html_parser)
-        self.find_all_ads_on_page(soup)
-        last_page = soup.find("li", {"class": "last"}).find("a").get("href")
-        pagination = int(last_page.split("page=")[1])
-        for number in range(1, pagination + 1):
-            link = f"https://x-bikers.com/board/index.php?&page={number}"
-            try:
-                page = requests.get(link, headers=self.user_agent, timeout=10)
-            except requests.exceptions.RequestException:
-                continue
-            soup = BeautifulSoup(page.content, self.html_parser)
+        for response in self.responses:
+            soup = BeautifulSoup(response.content, self.html_parser)
             self.find_all_ads_on_page(soup)
 
     def find_all_ads_on_page(self, soup: BeautifulSoup) -> None:
@@ -183,16 +188,16 @@ class XBikers:
             except AttributeError:
                 continue
             _id = advert["link"].split("id=")[-1]
-            self.check_ad(_id, advert)
+            if self.send_notice:
+                self.send_advert(_id, advert)
 
-    def check_ad(self, _id: str, advert: dict) -> None:
+    def send_advert(self, _id: str, advert: dict) -> None:
         _id = f"xbikers:{_id}"
         with redis.Redis(decode_responses=True) as redis_client:
             exists = redis_client.exists(_id)
             if not exists:
                 redis_client.hset(_id, mapping=advert)
-                if self.send_notice:
-                    redis_client.publish("bicycle", _id)
+                redis_client.publish("bicycle", _id)
 
 
 def main() -> None:
