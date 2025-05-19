@@ -1,5 +1,8 @@
 import json
+import logging
+from os import getenv
 from threading import Thread
+from typing import List
 
 import lxml
 import pika
@@ -23,28 +26,56 @@ class Request:
 
 
 class RabbitMQPublisher:
-    @staticmethod
-    def send(queue: str, notifications: list) -> None:
-        connection = None
+    def __init__(self) -> None:
+        self.validate_env_vars(["RABBITMQ_HOST", "RABBITMQ_PORT", "RABBITMQ_DEFAULT_USER", "RABBITMQ_DEFAULT_PASS"])
+        self.host = getenv("RABBITMQ_HOST")
+        self.port = getenv("RABBITMQ_PORT")
+        self.user = getenv("RABBITMQ_DEFAULT_USER")
+        self.password = getenv("RABBITMQ_DEFAULT_PASS")
+        self.queue = "parsed_bicycle_ads"
+        self.connection = None
+        self.channel = None
+        self.connect()
+
+    def validate_env_vars(self, required_vars: List[str]) -> None:
+        if missing_vars := [var for var in required_vars if not getenv(var)]:
+            logging.critical(f"RabbitMQ: missing required environment variables: {', '.join(missing_vars)}")
+            raise SystemExit(1)
+
+    def connect(self) -> None:
         try:
-            connection = pika.BlockingConnection(pika.ConnectionParameters())
-            channel = connection.channel()
-            channel.queue_declare(queue=queue, durable=True)
+            credentials = pika.PlainCredentials(self.user, self.password)
+            parameters = pika.ConnectionParameters(
+                host=self.host,
+                port=self.port,
+                credentials=credentials,
+            )
+            self.connection = pika.BlockingConnection(parameters)
+            self.channel = self.connection.channel()
+            self.channel.queue_declare(queue=self.queue, durable=True)
+            logging.info("RabbitMQ: connected")
+        except Exception as e:
+            logging.critical("RabbitMQ: connection failed")
+            raise SystemExit(1)
+
+    def send(self, notifications: List[dict]) -> None:
+        if not self.connection or self.connection.is_closed:
+            self.connect()
+        try:
             for notification in notifications:
-                channel.basic_publish(exchange="",
-                                      routing_key=queue,
-                                      body=json.dumps(notification),
-                                      properties=pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent))
-        except pika.exceptions.AMQPConnectionError:
-            return
-        finally:
-            if connection:
-                connection.close()
+                self.channel.basic_publish(
+                    exchange="",
+                    routing_key=self.queue,
+                    body=json.dumps(notification),
+                    properties=pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent),
+                )
+        except Exception as exc:
+            logging.warning(f"RabbitMQ: message not sent: {exc}")
 
 
 class Olx:
-    def __init__(self, queue: str, html_parser: str, user_agent: str) -> None:
-        self.queue = queue
+    def __init__(self, rabbitmq: RabbitMQPublisher, html_parser: str, user_agent: str) -> None:
+        self.rabbitmq = rabbitmq
         self.html_parser = html_parser
         self.user_agent = {"User-Agent": user_agent}
         self.base_url = "https://www.olx.ua"
@@ -71,7 +102,7 @@ class Olx:
         link = f"{self.base_url}{self.category}"
         response = Request.request([link], self.user_agent)
         if response:
-            soup = BeautifulSoup(response[0].content, self.html_parser)
+            soup = BeautifulSoup(response[0].text, self.html_parser)
             try:
                 tags = soup.find("ul", {"data-testid": "category-count-links"}).find_all("li")
                 for tag in tags:
@@ -82,7 +113,7 @@ class Olx:
 
     def find_pagination(self, response, subcategory: str) -> list:
         links = []
-        soup = BeautifulSoup(response.content, self.html_parser)
+        soup = BeautifulSoup(response.text, self.html_parser)
         tags = soup.find_all("li", {"data-testid": "pagination-list-item"})
         if tags:
             last_page = int(tags[-1].get_text())
@@ -93,10 +124,10 @@ class Olx:
 
     def parse_all_pages(self) -> None:
         for response in self.responses:
-            soup = BeautifulSoup(response.content, self.html_parser)
+            soup = BeautifulSoup(response.text, self.html_parser)
             notifications = self.find_all_ads_on_page(soup)
             if notifications:
-                RabbitMQPublisher.send(self.queue, notifications)
+                self.rabbitmq.send(notifications)
 
     def find_all_ads_on_page(self, soup: BeautifulSoup) -> list:
         notifications = []
@@ -117,8 +148,8 @@ class Olx:
 
 
 class XT:
-    def __init__(self, queue: str, html_parser: str, user_agent: str) -> None:
-        self.queue = queue
+    def __init__(self, rabbitmq: RabbitMQPublisher, html_parser: str, user_agent: str) -> None:
+        self.rabbitmq = rabbitmq
         self.html_parser = html_parser
         self.user_agent = {"User-Agent": user_agent}
         self.base_url = "http://xt.ht/phpbb"
@@ -140,7 +171,7 @@ class XT:
             soup = BeautifulSoup(response.text, self.html_parser)
             notifications = self.find_all_ads_on_page(soup)
             if notifications:
-                RabbitMQPublisher.send(self.queue, notifications)
+                self.rabbitmq.send(notifications)
 
     def find_all_ads_on_page(self, soup: BeautifulSoup) -> list:
         notifications = []
@@ -151,7 +182,9 @@ class XT:
                 advert = {}
                 advert["title"] = ad.find("a", {"class": "topictitle"}).get_text().lower()
                 advert["price"] = ad.find("span", {"name": "uah_cur"}).get_text().split("грн")[0].strip()
-                advert["link"] = f"{self.base_url}{ad.find("a", {"class": "topictitle"}).get("href").split("&sid=")[0][1:]}"
+                topictitle = ad.find("a", {"class": "topictitle"})
+                href = topictitle.get("href").split("&sid=")[0][1:]
+                advert["link"] = f"{self.base_url}{href}"
             except AttributeError:
                 continue
             notice["id"] = advert["link"].split(".php?")[1]
@@ -161,8 +194,8 @@ class XT:
 
 
 class XBikers:
-    def __init__(self, queue: str, html_parser: str, user_agent: str) -> None:
-        self.queue = queue
+    def __init__(self, rabbitmq: RabbitMQPublisher, html_parser: str, user_agent: str) -> None:
+        self.rabbitmq = rabbitmq
         self.html_parser = html_parser
         self.user_agent = {"User-Agent": user_agent}
         self.base_url = "https://x-bikers.com/board/"
@@ -177,7 +210,7 @@ class XBikers:
 
     def find_pagination(self, response) -> list:
         links = []
-        soup = BeautifulSoup(response.content, self.html_parser)
+        soup = BeautifulSoup(response.text, self.html_parser)
         try:
             pagination = soup.find("li", {"class": "last"}).find("a").get("href")
             last_page = int(pagination.split("page=")[1])
@@ -190,10 +223,10 @@ class XBikers:
 
     def parse_all_pages(self) -> None:
         for response in self.responses:
-            soup = BeautifulSoup(response.content, self.html_parser)
+            soup = BeautifulSoup(response.text, self.html_parser)
             notifications = self.find_all_ads_on_page(soup)
             if notifications:
-                RabbitMQPublisher.send(self.queue, notifications)
+                self.rabbitmq.send(notifications)
 
     def find_all_ads_on_page(self, soup: BeautifulSoup) -> list:
         notifications = []
@@ -214,17 +247,12 @@ class XBikers:
 
 
 def main() -> None:
-    try:
-        connection = pika.BlockingConnection(pika.ConnectionParameters())
-        connection.close()
-    except pika.exceptions.AMQPConnectionError:
-        return
-    queue = "bicycle"
+    rabbitmq = RabbitMQPublisher()
     html_parser = lxml.__name__
     user_agent = UserAgent(platforms="pc").random
-    olx = Olx(queue, html_parser, user_agent)
-    xt = XT(queue, html_parser, user_agent)
-    x_bikers = XBikers(queue, html_parser, user_agent)
+    olx = Olx(rabbitmq, html_parser, user_agent)
+    xt = XT(rabbitmq, html_parser, user_agent)
+    x_bikers = XBikers(rabbitmq, html_parser, user_agent)
     thread_olx = Thread(target=olx.main)
     thread_xt = Thread(target=xt.main)
     thread_x_bikers = Thread(target=x_bikers.main)
@@ -234,6 +262,9 @@ def main() -> None:
     thread_olx.join()
     thread_xt.join()
     thread_x_bikers.join()
+    if rabbitmq.connection and rabbitmq.connection.is_open:
+        rabbitmq.connection.close()
+        logging.info("RabbitMQ: connection closed")
 
 
 if __name__ == "__main__":
